@@ -1,0 +1,148 @@
+---
+title: "Search Lambda"
+format: html
+---
+
+```{python}
+import numpy as np
+import pandas as pd
+import rsw
+
+design_mat_2 = pd.read_csv("themed/rsw_inputs/rsw_design_mat_3.csv")
+target_2 = pd.read_csv("themed/rsw_inputs/rsw_target_3.csv")
+
+# Take advantage of interactions being last in design matrix
+main_fx = target_2.iloc[:71]
+interactions = target_2.iloc[71:]
+
+# Equality Loss on mains, LS on interactions for flexibility
+losses = [rsw.EqualityLoss(np.array(main_fx).flatten()),
+          rsw.LeastSquaresLoss(np.array(interactions).flatten())]
+          
+regularizer = rsw.EntropyRegularizer()
+
+# could do more search, this is enough for the point
+num_lambdas = 10
+lambdas = np.linspace(.01,10, num_lambdas)
+
+n = 2074
+weights_matrix = np.zeros((n, num_lambdas))
+
+# Loop through each lambda value
+for i, lam in enumerate(lambdas):
+    w_2, out_2, sol_2 = rsw.rsw(df = design_mat_2,
+                                funs = None,
+                                losses = losses,
+                                regularizer = regularizer,
+                                lam = lam)
+    print(i)
+    weights_matrix[:, i] = w_2  # Storing each w_2 in the matrix
+```
+
+```{python}
+np.savetxt("themed/rsw_outputs/weights_lambda_search.csv", weights_matrix, delimiter=",", fmt='%s')
+```
+
+```{r}
+library(tidyverse)
+library(survey)
+library(autumn)
+
+weights_mat <- read.csv("themed/rsw_outputs/weights_lambda_search.csv",
+                        header = F) * 2074
+
+vote_contrast <- quote((recode_vote_2016Democrat - recode_vote_2016Republican) /
+                       (recode_vote_2016Democrat + recode_vote_2016Republican))
+
+pew <- readRDS("themed/capsule-4173151/data/pew.rds")
+
+# For the calibration formula, can't have linearly dependent vars like state/region
+formula_3_cb <- ~recode_age_bucket + recode_female  +
+                recode_race + recode_educ + recode_inputstate
+
+rsw_design <- svydesign(ids = ~1, data = pew, weights =  weights_mat[,10])
+
+svycontrast(svymean(~recode_vote_2016, rsw_design, na.rm = TRUE),
+                        vote_contrast)
+
+```
+
+```{r}
+# Assuming weights_mat is already defined and has 10 columns
+
+# Initialize an empty dataframe to store the results
+results_df <- data.frame(matrix(ncol = 4, nrow = 0))
+colnames(results_df) <- c("Estimate", "low","high", "ColumnIndex")
+
+# Loop over each column in weights_mat
+for (i in 1:10) {
+    # Define the survey design using the current column of weights
+    rsw_design <- svydesign(ids = ~1, data = pew, weights = weights_mat[,i])
+
+    # Compute the contrast
+    x <- svycontrast(svymean(~recode_vote_2016, rsw_design, na.rm = TRUE),
+                     vote_contrast)
+
+    # Combine the estimate and its standard error, and the column index
+    result <- c(x, confint(x), i)
+
+    # Append the result to the dataframe
+    results_df <- rbind(results_df, t(result))
+}
+
+# The results_df dataframe now contains the estimates, their SEs, and the corresponding column index from weights_mat
+```
+
+```{r}
+library(ggplot2)
+
+results_df %>% ggplot(aes(x = V4, y = contrast, ymin = V2, ymax = V3)) +
+    geom_pointrange() +
+    geom_hline(yintercept = c(0, .022),
+               linetype = c("solid", "dashed")) +
+    scale_y_continuous(breaks = c(0.22, seq(-.05, .1, .05)),
+                       minor_breaks = NULL,
+                       labels = scales::percent_format())
+```
+
+```{r}
+library(plotly)
+library(shiny)
+
+createHistogram <- function(m) {
+  # Select the m-th column of the dataframe
+  data <- weights_mat[, m]
+
+  # Create a Plotly histogram
+  p <- plot_ly(x = data, type = "histogram")
+
+  return(p)
+}
+
+createHistogram(10)
+```
+
+```{r}
+ui <- fluidPage(
+  titlePanel("Interactive Histogram"),
+  sidebarLayout(
+    sidebarPanel(
+      sliderInput("slider", "Select m Value:",
+                  min = 1, max = 10, value = 1)
+    ),
+    mainPanel(
+      plotlyOutput("histogram")
+    )
+  )
+)
+
+server <- function(input, output) {
+  output$histogram <- renderPlotly({
+    createHistogram(input$slider)
+  })
+}
+
+shinyApp(ui = ui, server = server)
+
+```
+

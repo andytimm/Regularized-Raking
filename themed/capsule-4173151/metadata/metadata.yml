@@ -1,0 +1,27 @@
+metadata_version: 1
+name: Chapter 4 of "Target Estimation and Adjustment Weighting for Unrepresentative
+  Survey Samples"
+description: R code for Chapter 4 of "Target Estimation and Adjustment Weighting for
+  Unrepresentative Survey Samples" (Cambridge Elements)
+tags:
+- caughey-et-al-weighting-element
+authors:
+- name: Devin Caughey
+  affiliations:
+  - name: Massachusetts Institute of Technology
+- name: Adam Berinsky
+  affiliations:
+  - name: Massachusetts Institute of Technology
+- name: Sara Chatfield
+  affiliations:
+  - name: University of Denver
+- name: Erin Hartman
+  affiliations:
+  - name: University of California, Los Angeles (USA)
+- name: Eric Schickler
+  affiliations:
+  - name: University of California, Berkeley
+- name: Jasjeet S. Sekhon
+  affiliations:
+  - name: University of California, Berkeley
+corresponding_contributor: {}

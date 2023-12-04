@@ -1,0 +1,997 @@
+---
+title: Regularized Raking 
+subtitle: for better survey estimates
+format:
+  clean-revealjs:
+    self-contained: true
+author:
+  - name: Andy Timm
+date: last-modified
+bibliography: refs.bib
+---
+
+```{r, echo=F,output=F}
+set.seed(605)
+library(tidyverse)
+library(survey)
+
+```
+
+
+## Introduction 
+
+**Raking** is among the most commonly used algorithms for building survey weights such that a unrepresentative sample can be used to make inferences about the general population.
+
+**Regularized Raking** extends this framework,
+allowing for more explicit and granular tradeoffs to be made on properties of the weights set.
+
+### Goals:
+1. Review vanilla raking, and clarify in what sense the weights it produces are 'optimal'.
+2. Argue that vanilla raking's implicit objective isn't a great fit for modern survey inference,
+and show why Regularized Raking is a good framework for improvements.
+
+## Outline
+
+-   Quick about me (& my weights!)
+-   Raking: easy mode (introduce/review vanilla raking)
+-   Raking: hard mode (when raking gets confusing)
+-   Introduce regularized raking
+-   Examples where RR makes a difference
+-   RR in the survey weights cinematic universe (comparisons to MRP, multilevel calibration, broader challenges of modern survey inference, etc)
+
+## About me (& my weights)
+
+- Data scientist working in politics and advertising; both have given me a
+lot of cause to think hard about weights.
+
+Some recent types of weights I've worked on:
+
+-  TV viewership weights (weight ~41M TV viewership panel to US TV viewing gen pop)
+-  Political 'Microtargeting' Surveys (sample 5-10k people, weight to voter file, then model)
+-  COVID Vaccine Message Testing (multi-arm RCT to convince people to get vaccine, weight to customers of our pharmacy partner)
+-  \+ More (Market Research, RCTs in politics, RCTs in advertising with survey outcomes...)
+
+# Raking (Easy Mode) {background-color="#40666e"}
+
+## Let's introduce/review raking!
+
+We have a **non-representative** sample from a larger universe, which we want
+to use to make inferences about that universe. How do we best assign weights
+to each observation in the sample to make (weighted) estimates representative?
+
+In Easy Mode:
+
+  - Our outcome $Y^N$ is correlated with demographics (even in easy mode)
+  - We'll have **Ignorable Non-Response** (conditional on weighting vars)
+  - More specifically, our sample happens to only need adjustment on *age* and
+  *race* to match gen pop on this outcome
+  - We somehow know everything we need to weight on to estimate $Y^N$
+  - We also somehow know age and race proportions of the sample and universe
+  completely without error
+  
+# Raking
+
+Raking is an iterative algorithm for building sample weights such that (weighted)
+sample marginal distributions match population marginal distributions.
+
+We'll generate a synthetic universe, sample in biased fashion from it, then
+rake it by hand and with `autumn` in R.
+
+# Generating Data
+
+```{r}
+#| echo: true
+n_universe <- 100000  
+n_sample <- 1000    
+
+# Universe Data Generating Process
+universe <- tibble(
+  age = sample(c("young", "old"),
+               n_universe, replace = TRUE,
+               prob = c(0.5, 0.5)),
+  race = sample(c("white", "black", "asian", "hispanic", "other"),
+                n_universe, replace = TRUE,
+                prob = c(0.6, 0.1, 0.1, 0.1, 0.1)))
+
+# Defining the outcome (probability of enjoying pineapple on pizza)
+universe <- universe %>%
+  mutate(enjoys_pineapple = plogis(rnorm(n_universe,-1,.5) +  #bias term
+                              1*ifelse(race == "white", 1, 0) + # More likely if white
+                              .5*ifelse(age == "old", 1, 0))) # More likely if older
+                                
+```
+
+## Check distribution
+
+```{r}
+#| echo: true
+#| output: true
+
+universe %>% summarize(mean_p = mean(enjoys_pineapple))
+
+universe %>%
+  group_by(age,race) %>%
+  summarize(mean_p = mean(enjoys_pineapple)) %>%
+  arrange(mean_p)
+```
+# Sample with Bias
+
+```{r}
+#| echo: true
+#| output: true
+
+# Parameters for the sample distribution
+age_weights <- c(young = 1, old = 2)  # Old twice as likely
+race_weights <- c(white = 5, black = 2,
+                  asian = .5, hispanic = 1, other = 3)  # Also Wrong
+
+universe <- universe %>%
+  mutate(
+    age_weight = age_weights[age],
+    race_weight = race_weights[race],
+    sample_weight = age_weight * race_weight
+  )
+
+# Draw the sample
+sample_data <- universe %>%
+  sample_n(size = n_sample, weight = sample_weight)
+
+# Not our mean!
+sample_data %>% summarize(mean_p = mean(enjoys_pineapple))
+```
+
+# Shake and Rake
+
+Raking proceeds variable by variable, adding weights to fix bias on 1 marginal at a time,
+until convergence.
+
+
+```{r}
+#| echo: true
+#| output: true
+
+# 1. Determine the Target Distribution for Age in the Universe
+age_distribution_universe <- universe %>% 
+  count(age) %>% 
+  mutate(proportion = n / sum(n))
+
+# 2. Calculate Initial Sample Weights (assuming equal probability of selection initially)
+sample_data <- sample_data %>%
+  mutate(weight = 1)
+
+
+```
+
+# Shake and Rake
+
+```{r}
+#| echo: true
+#| output: true
+
+# 3. Raking Step: Adjust Weights for Age
+# a. Calculate the distribution of age in the sample
+age_distribution_sample <- sample_data %>% 
+  count(age) %>% 
+  mutate(proportion = n / sum(n))
+
+# b. Join with the target distribution to get the adjustment factor
+adjustment_factors <- age_distribution_sample %>%
+  left_join(age_distribution_universe, by = "age", suffix = c("_sample", "_universe")) %>%
+  mutate(adjustment_factor = proportion_universe / proportion_sample)
+
+# c. Apply the adjustment factor to the sample weights
+sample_data <- sample_data %>%
+  left_join(adjustment_factors, by = "age") %>%
+  mutate(raked_weight = weight * adjustment_factor)
+
+# 2x weight for younger folks, as we'd expect
+sample_data %>% group_by(age) %>% summarize(mean_weight = mean(raked_weight))
+```
+## Shake and Rake
+
+### Now race
+
+```{r}
+# 1. Determine the Target Distribution for Race in the Universe
+race_distribution_universe <- universe %>% 
+  count(race) %>% 
+  mutate(proportion = n / sum(n))
+
+# 2. Raking Step for Race: Adjust Weights for Race
+# a. Calculate the distribution of race in the sample with current weights
+race_distribution_sample <- sample_data %>% 
+  count(race, wt = raked_weight) %>% 
+  mutate(proportion = n / sum(n))
+
+# b. Join with the target distribution to get the race adjustment factor
+race_adjustment_factors <- race_distribution_sample %>%
+  left_join(race_distribution_universe, by = "race", suffix = c("_sample", "_universe")) %>%
+  mutate(adjustment_factor_race = proportion_universe / proportion_sample)
+
+# c. Apply the race adjustment factor to the already raked weights
+sample_data <- sample_data %>%
+  left_join(race_adjustment_factors, by = "race") %>%
+  mutate(raked_weight = raked_weight * adjustment_factor_race)
+```
+
+```{r}
+#| echo: true
+#| output: true
+
+# Not showing calculation, since they're identical.
+sample_data %>% group_by(race) %>% summarize(mean_weight = mean(raked_weight))
+
+# Notice: slightly further from universe than after first iter
+sample_data %>% group_by(age) %>% summarize(mean_weight = mean(raked_weight))
+```
+
+`...` and repeat until sample means on all marginals match population ones.
+
+## Less Manual: with `autumn`
+
+`autumn` is a wonderful package for raking.
+
+```{r}
+#| echo: true
+#| output: true
+
+library(autumn)
+
+target <- list(
+  age = c(young = .5, old = .5), 
+  race = c(white = .6, 
+             hispanic = .1, 
+             black = .1, 
+             asian = .1,
+             other = .1)
+)
+# See ?harvest for summary of other functionality
+sample_data <- sample_data %>% harvest(target,max_weight = 10)
+
+# With raked weights, we recover the population mean as expected
+sample_data %>% summarize(mean_p = weighted.mean(enjoys_pineapple,weights))
+```
+# Raking (hard Mode) {background-color="#40666e"}
+
+## Back to reality
+
+Sadly, reality makes weighting much harder.
+
+-   Phone response rates are now frequently less than 1%
+-   Many survey researchers now use online panels and/or non-probability sample methods
+-   Outcomes are frequently related to propensity to respond in complicated ways
+-   So respondents are getting increasingly weird, in ways we can't just weight
+out along a small set of census demographics
+
+In other words, we live in a world of **Non-Ignorable Nonresponse**. What effects
+does this have on weighting?
+
+## A huge amount of pressure on weighting
+
+:::: {.columns}
+
+::: {.column width="50%"}
+![](images/nyt_battleground_dims.png)
+:::
+
+::: {.column width="50%"}
+
+- Trying to weight to cover all the issues sampling can't
+- On the left, everything the NYT weighted their recent 2024 battleground state
+poll on
+- Of course, we probably believe interactions of variables matter too...
+- Many of these variables are included because they seem correlated with
+constructs we'd struggle to quantify directly
+:::
+
+::::
+
+## Raking on everything isn't free
+
+-   In many cases, raking on everything we want to won't even converge.
+-   So we end up picking and choosing which variables and interactions theoretically
+matter most.
+
+Second class of issues: variance problems
+
+-   Raking on more dimensions can lower bias, but it often adds variance too
+-   This leads to heuristic ways to control variance
+  - Rules of thumb like desiring a $deff_{kish}$ < 1.5
+  - Trimming weights (cap/floor the tails of the weights distribution) 
+  
+## Restating problems with raking on hard mode
+
+Let's restate the last few slides in terms of specific problems alternative
+weighting methods can solve:
+
+
+1. Variables are either "in" or "out"
+2. We have a fairly limited set of tools to manage variance of estimates
+3. It's not clear in what sense the raking solution is optimal
+
+# Regularized Raking {background-color="#40666e"}
+
+## Regularized Raking
+
+[@barratt_optimal_2021] show that the broader representative sample weights problem
+can be understood as an optimization problem:
+
+$$
+\begin{array}{ll}
+\operatorname{minimize} & \ell\left(f, f^{\mathrm{target}}\right)+\lambda r(w) \\
+\text { subject to } & \quad w \geq 0, \quad \mathbf{1}^T w=1
+\end{array}
+$$
+Let's step through this term by term.
+
+## Regularized Raking - Loss
+
+$$
+\begin{array}{ll}
+\operatorname{\color{grey}{minimize}} & \ell\left(f, f^{\mathrm{target}}\right)\color{grey}{+\lambda r(w)} \\
+\color{grey}{ \text { subject to } } & \color{grey}{ \quad w \geq 0, \quad \mathbf{1}^T w=1}
+\end{array}
+$$
+
+-   We have $f$ and $f^{target}$, which are functions of our sample and target population
+-   We'll also specify some loss function $\ell$, which clarifies how we want
+$f$ and $f^{target}$ to be close
+
+## Regularized Raking
+
+### Loss examples - Ok, so what?
+
+:::: {.columns}
+
+::: {.column width="60%"}
+
+$$
+\ell\left(f, f^{\mathrm{des}}\right)= \begin{cases}0 & f = f^{target} \\ +\infty & \text { otherwise }\end{cases}
+$$
+
+-   In other words, $f$ must match $f^{target}$ exactly to be a valid solution
+-   If we take $f$ to be a simple expected value, this is what vanilla raking requires on all
+raking dimensions!
+:::
+
+::: {.column width="40%"}
+
+![](images/mcmahon_1.png)
+:::
+
+::::
+
+## Regularized Raking
+
+### Loss examples - Getting Interesting
+
+:::: {.columns}
+
+::: {.column width="60%"}
+
+$$
+\ell\left(f, f^{\mathrm{des}}\right)= \begin{cases}0 & f^{\min } \leq f \leq f^{\max } \\ +\infty & \text { otherwise }\end{cases}
+$$
+
+-   `...` But why do we always want exact matching on every raking variable?
+-   That would expand the realm of possible solutions!
+
+:::
+
+::: {.column width="40%"}
+
+![](images/mcmahon_2.png)
+:::
+
+::::
+
+## Regularized Raking
+
+### Loss examples - Now we're getting somewhere
+
+:::: {.columns}
+
+::: {.column width="40%"}
+
+![](images/losses.png)
+
+-   Continuous loss is possible!
+-   Closer can be better, and further away is not infinitely bad!
+
+:::
+
+::: {.column width="60%"}
+
+![](images/mcmahon_3.png)
+:::
+
+::::
+
+## Regularized Raking
+
+### Loss examples - full force
+
+:::: {.columns}
+
+::: {.column width="60%"}
+
+-   **We can have different losses for different $f$!**
+-   Example:
+    - require equality on single dimensions,
+    - least squares on all interactions, and
+    - different scaling such that different interactions are "worth" more according to theory or backtesting.
+
+
+:::
+
+::: {.column width="40%"}
+
+![](images/mcmahon_4.png)
+:::
+
+::::
+
+## Regularized Raking
+
+### Regularization
+
+$$
+\begin{array}{ll}
+\operatorname{\color{grey}{minimize}} & \color{grey}{\ell\left(f, f^{\mathrm{target}}\right)+}\lambda r(w) \\
+\color{grey}{ \text { subject to } } & \color{grey}{ \quad w \geq 0, \quad \mathbf{1}^T w=1}
+\end{array}
+$$
+
+::: {style="font-size: 85%;"}
+
+-   We don't just care about adherence to population totals.
+-   What about variance of weights, shape of distribution, etc?
+-   We might want weights that are:
+    - As uniform as possible
+    - As close to some other target distribution with different variance properties
+-   $r(w)$ can be chosen from a variety of regularizers that encode such preferences
+- Also have a hyperparameter $\lambda$, which allows us to make explicit tradeoffs
+between our loss term and our regularization term.
+
+:::
+
+## Regularized Raking
+
+### Regularization Example 1
+
+$$
+r(w) = \sum_{i=1}^{n} w_i \operatorname{logw}_i
+$$
+
+-   This is the negative entropy, equivalent to the Kullback–Leibler divergence from the
+weights distribution $w$ and the uniform distribution
+-   This would express a desire that our weights be as uniform as possible,
+subject to all our other constraints
+-   This is the other half of what vanilla raking does!
+
+## Regularized Raking
+
+### Regularization Example 2
+
+$$
+D_{\text{KL}}(w \parallel w^{des}) = \sum_{i=1}^{n} w \log\left(\frac{w}{w^{des}}\right)
+$$
+
+-   Alternatively, might want a weights distribution close to some target distribution
+$w^{des}$, where closeness is defined in terms of KL divergence
+-   Motivations: minimizing extreme tails, more demand for smoothness
+
+## Regularized Raking
+
+### Constraints
+
+$$
+\begin{array}{ll}
+\operatorname{\color{grey}{minimize}} & \color{grey}{\ell\left(f, f^{\mathrm{des}}\right)+\lambda r(w)} \\
+\text { subject to } & \quad w \geq 0, \quad \mathbf{1}^T w=1
+\end{array}
+$$
+
+-   Non-negative weights are useful (not all estimators play well with negative weights)
+-   We want weights to sum to 1 (equivalently: rescale to sum to n)
+
+::: aside
+Quick note that there's a third constraint required $f = Fw$ that I'm
+suppressing- it's necessary to state the optimization problem precisely, but
+I don't want to go there this talk. See the paper for more detail.
+:::
+
+## So what does vanilla raking do?
+
+$$
+\ell\left(f, f^{\mathrm{target}}\right)=\left\{\begin{array}{ll}
+0 & f=f^{\mathrm{target}}, \\
++\infty & \text { otherwise },
+\end{array} \quad r(w)=\sum_{i=1}^n w_i \log w_i\right.
+$$
+
+-   Equality loss on all raking dimensions
+-   Negative entropy regularizer
+-   Hopefully, this gives some clarity about what raking optimizes for
+-   As we've seen, this is far from the only choice of $\ell$ and $r(w)$; are
+other choices better?
+
+::: aside
+If you're interested in a precise statement of this, raking can be seen as coordinate ascent on the dual of the maximum entropy problem. 
+See Appendix A of [@barratt_optimal_2021] for a illustration of this, or [@deville_generalized_1993;@teh_improving_2003].
+:::
+
+# Examples where RR helps {background-color="#40666e"}
+
+## Data
+
+::: {style="font-size: 85%;"}
+
+Let's get back into some code, and comparisons. I'll be using a poll conducted by
+Pew in 2016, with 2074 likely voter respondents. The outcome of interest is
+**vote margin**, or the number of voters who favored Clinton minus those who
+favored Trump.
+
+I like this dataset for a few reasons: 
+
+-   Easy access
+-   There is a correct answer, and we know it (Hilary won the national vote by 2.2%)
+-   If you do not weight by education, you will be wrong by like 10 points :)
+-   Decent variety of covariates
+
+We'll treat estimates from the 2016 CCES as a target, because it's huge, representative,
+and also easily accessible.
+
+:::
+
+```{r}
+
+### Re-using and extending some example code from Caughey et al (2021)
+# Check out their excellent book on target estimation and adjustment weighting
+# https://codeocean.com/capsule/4173151/tree/v1
+# To reproduce this analysis, you'll need to pull the CCES and pew data
+
+# Convenience function that turns formulas into what's needed for calibrate
+create_targets <- function (target_design, target_formula) {
+    target_mf <- model.frame(target_formula, model.frame(target_design))
+    target_mm <- model.matrix(target_formula, target_mf)
+    wts <- weights(target_design)
+    colSums(target_mm * wts) / sum(wts)
+}
+
+rsw_design_matrix <- function (target_design, target_formula) {
+    # Make weighted universe proportions
+    target_mf <- model.frame(target_formula, model.frame(target_design))  %>% modify_if(is.character, as.factor)
+    target_mm <- model.matrix(target_formula, target_mf,
+                              contrasts.arg = lapply(target_mf[sapply(target_mf, is.factor)],
+                                                     contrasts, contrasts=FALSE))
+    
+    target_mm[,-1]
+}
+
+rsw_target <- function (target_design, target_formula) {
+    # Make weighted universe proportions
+    target_mf <- model.frame(target_formula, model.frame(target_design))  %>% modify_if(is.character, as.factor)
+    target_mm <- model.matrix(target_formula, target_mf,
+                              contrasts.arg = lapply(target_mf[sapply(target_mf, is.factor)],
+                                                     contrasts, contrasts=FALSE))
+    
+    #target_mm
+    wts <- weights(target_design)
+    props <- colSums(target_mm * wts) / sum(wts)
+     
+    props[-1]
+}
+
+cces <- read_rds("capsule-4173151/data/cces.rds")
+pew <- readRDS("capsule-4173151/data/pew.rds")
+
+
+### Drop invalid cases
+cces <- cces %>%
+    filter((CC16_401 == "I definitely voted in the General Election.") &
+           !is.na(commonweight_vv_post))
+
+pew_design <- svydesign(ids = ~1, data = pew)
+
+# survey's design object
+cces_wt_design <- svydesign(ids = ~1, weights = ~commonweight_vv_post, data = cces)
+
+vote_contrast <- quote((recode_vote_2016Democrat - recode_vote_2016Republican) /
+                       (recode_vote_2016Democrat + recode_vote_2016Republican))
+```
+
+## Introducing `rsw`
+
+Let's walk through a basic example in both `survey`, and `rsw`, the python package
+from [@barratt_optimal_2021] to build familiarity. We'll weight just on age,
+gender, race, and region to show syntax.
+
+### R First
+
+```{r}
+#| echo: true
+#| output: true
+
+formula_1 <- ~recode_age_bucket + recode_female + recode_race + recode_region
+
+# Convenience function to make targets for a formula given a `survey` design obj
+target_1 <- create_targets(cces_wt_design,formula_1)
+rsw_design_mat_1 <- rsw_design_matrix(pew_design, formula_1)
+rsw_target_1 <- rsw_target(cces_wt_design, formula_1)
+
+pew_raked_1 <- calibrate(design = pew_design,
+                       formula = formula_1,
+                       population = target_1,
+                       calfun = "raking")
+
+svycontrast(svymean(~recode_vote_2016, pew_raked_1, na.rm = TRUE),
+                        vote_contrast)
+```
+
+
+```{r}
+write.csv(rsw_design_mat_1,"rsw_inputs/rsw_design_mat_1.csv",row.names = F)
+write.csv(rsw_target_1,"rsw_inputs/rsw_target_1.csv",row.names = F)
+```
+
+
+## Now with `rsw`
+
+```{python}
+import pandas as pd
+import numpy as np
+```
+
+
+```{python}
+#| echo: true
+#| output: true
+import rsw
+
+design_mat_1 = pd.read_csv("rsw_inputs/rsw_design_mat_1.csv")
+target_1 = pd.read_csv("rsw_inputs/rsw_target_1.csv")
+
+losses = [rsw.EqualityLoss(np.array(target_1).flatten())]
+regularizer = rsw.EntropyRegularizer()
+w, out, sol = rsw.rsw(df = design_mat_1,
+                      funs = None,
+                      losses = losses,
+                      regularizer = regularizer,
+                      lam = 1) 
+```
+
+```{python}
+np.savetxt("rsw_outputs/basic_weights.csv", w, delimiter=",", fmt='%s')
+```
+
+```{r}
+raked_1 <- enframe(weights(pew_raked_1)*2074) %>% mutate(method = "rake")
+rsw_weights_1 <- (read.csv("rsw_outputs/basic_weights.csv",header = F)*2074) %>% mutate(method = "rsw") %>% rename(value = V1)
+
+compare_weights_1 <- bind_rows(raked_1,rsw_weights_1)
+```
+Steps:
+
+1. Create an array of loss objects, which specify both the function to use
+and the target for $\ell$
+2. Create a regularizer
+3. Pass these and data to `rsw`, optionally with alternative functions of data,
+or hyperparameters
+
+## Illustration: this is what raking is
+
+```{r}
+#| echo: true
+#| output: true
+rsw_design_1 <- svydesign(ids = ~1, data = pew, weights = rsw_weights_1$value,
+              # Ensures we handle these not being sampling weights
+              # See: https://cran.r-project.org/web/packages/survey/vignettes/precalibrated.pdf
+              calibrate.formula = formula_1)
+
+svycontrast(svymean(~recode_vote_2016, rsw_design_1, na.rm = TRUE),
+                        vote_contrast)
+
+compare_weights_1 %>%
+  ggplot(aes(x = value, color = method, fill = method)) + 
+  geom_density(alpha=.5)+
+  scale_fill_manual(values=c("red","blue"))
+```
+
+## About as far as raking will take us
+
+```{r}
+#| echo: true
+#| output: true
+
+formula_2 <- ~ recode_age_bucket + recode_female +
+                recode_race *recode_region * recode_educ_3way
+    
+
+# Convenience function to make targets for a formula given a `survey` design obj
+target_2 <- create_targets(cces_wt_design,formula_2)
+
+pew_raked_2 <- calibrate(design = pew_design,
+                       formula = formula_2,
+                       population = target_2,
+                       calfun = "raking")
+
+svycontrast(svymean(~recode_vote_2016, pew_raked_2, na.rm = TRUE),
+                        vote_contrast)
+```
+
+## Taking advantage of RR's flexibility
+
+```{r}
+#| echo: true
+#| output: true
+
+formula_3 <- ~recode_age_bucket + recode_female +
+                recode_inputstate + recode_race * recode_region * recode_educ
+```
+
+```{r}
+rsw_design_mat_2 <- rsw_design_matrix(pew_design, formula_3)
+rsw_target_2 <- rsw_target(cces_wt_design, formula_3)
+
+write.csv(rsw_design_mat_2,"rsw_inputs/rsw_design_mat_2.csv",row.names = F)
+write.csv(rsw_target_2,"rsw_inputs/rsw_target_2.csv",row.names = F)
+```
+
+
+```{python}
+#| echo: true
+#| output: true
+design_mat_2 = pd.read_csv("rsw_inputs/rsw_design_mat_2.csv")
+target_2 = pd.read_csv("rsw_inputs/rsw_target_2.csv")
+
+# Take advantage of interactions being last in design matrix
+main_fx = target_2.iloc[:71]
+interactions = target_2.iloc[71:]
+
+# Equality Loss on mains, LS on interactions for flexibility
+losses = [rsw.EqualityLoss(np.array(main_fx).flatten()),
+          rsw.LeastSquaresLoss(np.array(interactions).flatten())]
+          
+regularizer = rsw.EntropyRegularizer()
+w_2, out_2, sol_2 = rsw.rsw(df = design_mat_2,
+                      funs = None,
+                      losses = losses,
+                      regularizer = regularizer,
+                      lam = 1) 
+```
+
+```{python}
+np.savetxt("rsw_outputs/interacted_weights.csv", w_2, delimiter=",", fmt='%s')
+```
+
+```{r}
+raked_2 <- enframe(weights(pew_raked_2)*2074) %>% mutate(method = "rake")
+rsw_weights_2 <- (read.csv("rsw_outputs/interacted_weights.csv",header = F)*2074) %>% mutate(method = "rsw") %>% rename(value = V1)
+
+compare_weights_2 <- bind_rows(raked_2,rsw_weights_2)
+```
+
+## How does this do?
+
+### Pretty happy with this
+
+```{r}
+#| echo: true
+#| output: true
+compare_weights_2 %>%
+  ggplot(aes(x = value, color = method, fill = method)) + 
+  geom_density(alpha=.5)+
+  scale_fill_manual(values=c("red","blue"))
+```
+
+```{r}
+# For the calibration formula, can't have linearly dependent vars like state/region
+formula_3_cb <- ~recode_age_bucket + recode_female  +
+                recode_race + recode_educ + recode_inputstate
+```
+
+
+```{r}
+rsw_design_2 <- svydesign(ids = ~1, data = pew, weights = rsw_weights_2$value,
+              calibrate.formula = formula_3_cb)
+
+svycontrast(svymean(~recode_vote_2016, rsw_design_2, na.rm = TRUE),
+                        vote_contrast)
+```
+
+## Pushing it further to see regularization
+
+```{r}
+#| echo: true
+#| output: true
+
+formula_4 <- ~recode_inputstate + recode_age_bucket * recode_female *
+                 recode_race * recode_region * recode_educ * recode_pid_3way
+```
+
+```{r}
+rsw_design_mat_3 <- rsw_design_matrix(pew_design, formula_4)
+rsw_target_3 <- rsw_target(cces_wt_design, formula_4)
+
+write.csv(rsw_design_mat_3,"rsw_inputs/rsw_design_mat_3.csv",row.names = F)
+write.csv(rsw_target_3,"rsw_inputs/rsw_target_3.csv",row.names = F)
+```
+
+
+```{python}
+#| echo: true
+#| output: true
+design_mat_3 = pd.read_csv("rsw_inputs/rsw_design_mat_3.csv")
+target_3 = pd.read_csv("rsw_inputs/rsw_target_3.csv")
+
+# Take advantage of interactions being last in design matrix
+main_fx = target_3.iloc[:71]
+interactions = target_3.iloc[71:]
+
+# Equality Loss on mains, LS on interactions for flexibility
+losses = [rsw.EqualityLoss(np.array(main_fx).flatten()),
+          rsw.LeastSquaresLoss(np.array(interactions).flatten())]
+          
+regularizer = rsw.EntropyRegularizer()
+w_3, out_3, sol_3 = rsw.rsw(df = design_mat_3,
+                      funs = None,
+                      losses = losses,
+                      regularizer = regularizer,
+                      lam = 10) 
+```
+
+## Varying lambda can change estimates
+
+```{r}
+weights_mat <- read.csv("rsw_outputs/weights_lambda_search.csv",
+                        header = F) * 2074
+
+# Assuming weights_mat is already defined and has 10 columns
+
+# Initialize an empty dataframe to store the results
+lambda_search <- data.frame(matrix(ncol = 4, nrow = 0))
+colnames(lambda_search) <- c("Estimate", "low","high", "ColumnIndex")
+
+# Loop over each column in weights_mat
+for (i in 1:10) {
+    # Define the survey design using the current column of weights
+    rsw_design <- svydesign(ids = ~1, data = pew, weights = weights_mat[,i])
+
+    # Compute the contrast
+    x <- svycontrast(svymean(~recode_vote_2016, rsw_design, na.rm = TRUE),
+                     vote_contrast)
+
+    # Combine the estimate and its standard error, and the column index
+    result <- c(x, confint(x), i)
+
+    # Append the result to the dataframe
+    lambda_search <- rbind(lambda_search, t(result))
+}
+
+lambda_search <- lambda_search %>% mutate(lambda = seq(.01,10,length.out=10))
+
+# The results_df dataframe now contains the estimates, their SEs, and the corresponding column index from weights_mat
+```
+
+I won't show a ton of search over $\lambda$, but just to illustrate:
+
+```{r}
+#| output: true
+lambda_search %>% ggplot(aes(x = lambda, y = contrast, ymin = V2, ymax = V3)) +
+    geom_pointrange() +
+    geom_hline(yintercept = c(0, .022),
+               linetype = c("solid", "dashed")) +
+    scale_y_continuous(breaks = c(0.22, seq(-.05, .1, .05)),
+                       minor_breaks = NULL,
+                       labels = scales::percent_format()) +
+    ylab("2016 Vote Margin") +
+    xlab("lambda")
+```
+
+
+# Regularized Raking in the Survey Weights Cinematic Universe {background-color="#40666e"}
+
+## {background-image="images/polling_avengers.jpg" background-size="100%"}
+
+## Versus other modern options
+
+### MRP (and friends!)
+
+**Multilevel Regression and Postratification** [@gelman_using_2019] use a regularized model to
+predict the outcome, and poststratify.
+
+:::: {.columns}
+
+::: {.column width="50%"}
+#### Advantages
+
+-   with RR, you get typical weights, which can be applied to any outcome
+-   RR is OOMs faster, especially for big data and complex models
+-   Often, a little regularization goes a long way
+
+:::
+
+::: {.column width="50%"}
+#### Disadvantages
+
+-   Sometimes you actually want the whole posterior!
+-   For most small area estimates, MRP is going to be more efficient
+-   More generally, greater variety and flexibility of regularization
+
+:::
+
+::::
+
+## Versus other modern options
+
+### Multilevel Calibration
+
+**Multilevel Calibration** [@ben-michael_multilevel_2023] also takes an optimization approach, requires
+exact matching on the marginals, more flexibility on interactions
+
+:::: {.columns}
+
+::: {.column width="50%"}
+#### Advantages
+
+-   RR comes with greater flexibility to define loss, regularization
+-   User retains more ability to make tradeoffs
+
+:::
+
+::: {.column width="50%"}
+#### Disadvantages
+
+-   MC will choose how deep the interactions should go for you- a lot less choice
+involved
+-   Gets most of the value of approximate balance on interactions without iteration
+
+:::
+
+::::
+
+## Regularized Raking in the Survey Weights Cinematic Universe
+
+I've only been talking about only weighting today, so want to emphasize:
+
+-   Good sampling matters (and more than how you weight)
+-   Selection of weighting variables matters (and more than how you weight)
+
+That said, how you weight is entangled with these, as more flexible weighting
+gives you more options with the above.
+
+**Regularized Raking** gets a lot of the benefits of more heavily model based 
+based approaches without huge workflow changes, and is a more realistic fit
+for the demands of modern weighting.
+
+## Thank you! {.smaller}
+
+:::: {.columns}
+
+::: {.column width="50%"}
+#### Hire me!
+
+-   Currently looking political/non-profit data science roles.
+-   Experience as a data science manager, data scientist, and campaign staffer.
+-   keywords: Causal Inference, Bayes, HTE estimation, Surveys
+
+![](images/talk_materials_qr.png){width="66%"}
+
+:::
+
+::: {.column width="50%"}
+#### Materials/Suggestions 
+
+-   QR code for repo with full talk materials to left
+-   [@barratt_optimal_2021] for finer details of optimization behind talk today
+-   For perspective on challenges of modern survey weighting, highly recommend
+**A New Paradigm for Polling** [@bailey_new_2023]
+-   For how to think about picking targets and estimating them, I adore [@caughey_target_2020]- **Target Estimation and Adjustment Weighting for Survey Nonresponse and Sampling Bias**
+
+:::
+
+::::
+
+## References
+
