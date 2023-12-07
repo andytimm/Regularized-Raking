@@ -10,8 +10,9 @@ allowing for more explicit and granular tradeoffs to be made on properties of th
 ---
 
 There's a PDF of the slides, but to reproduce the code and follow along:
-1. Grab the entire reproduction capsule from [Chapter 4 of "Target Estimation and Adjustment Weighting for Unrepresentative Survey Samples"](https://codeocean.com/capsule/4173151/tree/v1), from which I (very gratefully) borrow some example polling data and preprocessing functions. Place it in the themed folder as is.
-2. Run `search_lambdas.qmd`, optionally modifying the parameters to determine how much search is done if you're curious.
-3. Run `themed.qmd` to reproduce the full analysis and slides.
+1. Install rsw using the instructions here: https://github.com/cvxgrp/rsw/tree/master
+2. Grab the entire reproduction capsule from [Chapter 4 of "Target Estimation and Adjustment Weighting for Unrepresentative Survey Samples"](https://codeocean.com/capsule/4173151/tree/v1), from which I (very gratefully) borrow some example polling data and preprocessing functions. Place it in the themed folder as is.
+3. Run `search_lambdas.qmd`, optionally modifying the parameters to determine how much search is done if you're curious.
+4. Run `themed.qmd` to reproduce the full analysis and slides.
 
 
